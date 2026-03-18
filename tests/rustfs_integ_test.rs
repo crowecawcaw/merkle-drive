@@ -41,13 +41,8 @@ async fn start_rustfs_drive() -> (S3Storage, testcontainers::ContainerAsync<Gene
 
     let endpoint = format!("http://127.0.0.1:{port}");
 
-    let creds = aws_credential_types::Credentials::new(
-        "testuser",
-        "testpassword",
-        None,
-        None,
-        "test",
-    );
+    let creds =
+        aws_credential_types::Credentials::new("testuser", "testpassword", None, None, "test");
 
     let config = aws_sdk_s3::Config::builder()
         .endpoint_url(&endpoint)
@@ -74,11 +69,7 @@ async fn start_rustfs_drive() -> (S3Storage, testcontainers::ContainerAsync<Gene
         .await
         .expect("failed to create metadata bucket");
 
-    let storage = S3Storage::new(
-        client,
-        DATA_BUCKET.to_string(),
-        META_BUCKET.to_string(),
-    );
+    let storage = S3Storage::new(client, DATA_BUCKET.to_string(), META_BUCKET.to_string());
 
     (storage, container)
 }
@@ -87,13 +78,8 @@ async fn start_rustfs_drive() -> (S3Storage, testcontainers::ContainerAsync<Gene
 fn connect_second_client(port: u16) -> S3Storage {
     let endpoint = format!("http://127.0.0.1:{port}");
 
-    let creds = aws_credential_types::Credentials::new(
-        "testuser",
-        "testpassword",
-        None,
-        None,
-        "test",
-    );
+    let creds =
+        aws_credential_types::Credentials::new("testuser", "testpassword", None, None, "test");
 
     let config = aws_sdk_s3::Config::builder()
         .endpoint_url(&endpoint)
@@ -142,6 +128,7 @@ fn inline_file(name: &str, data: &[u8]) -> LeafEntry {
 
 /// Helper: write a file as a blob, build a single-file root tree, commit it,
 /// and return (root_hash_hex, etag).
+#[allow(clippy::too_many_arguments)]
 async fn write_single_file(
     storage: &S3Storage,
     branch: &str,
@@ -454,14 +441,7 @@ async fn test_cas_conflict_between_clients() {
 
     // Both clients see the initial state
     let (_, etag1) = write_single_file(
-        &storage,
-        "main",
-        "file.txt",
-        b"initial",
-        None,
-        None,
-        "client-1",
-        "initial",
+        &storage, "main", "file.txt", b"initial", None, None, "client-1", "initial",
     )
     .await;
 
@@ -524,10 +504,7 @@ async fn test_cas_conflict_between_clients() {
         .await;
 
     // CAS conflict - the stale etag no longer matches
-    assert!(
-        result.is_err(),
-        "expected CAS conflict but got: {result:?}"
-    );
+    assert!(result.is_err(), "expected CAS conflict but got: {result:?}");
 }
 
 #[tokio::test]
@@ -663,7 +640,7 @@ async fn test_multi_file_directory() {
 
     let mut entries = Vec::new();
     for (name, content) in &files {
-        let blob_hex = storage.put_blob(*content).await.unwrap();
+        let blob_hex = storage.put_blob(content).await.unwrap();
         let blob_hash = hash::hex_decode(&blob_hex).unwrap();
         entries.push(LeafEntry::file(
             name.to_string(),
