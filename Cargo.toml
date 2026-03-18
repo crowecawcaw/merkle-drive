@@ -22,3 +22,4 @@ tempfile = "3"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["localstack"] }
 tokio = { version = "1", features = ["full", "test-util"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }

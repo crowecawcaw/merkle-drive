@@ -1704,6 +1704,7 @@ name = "merkle-drive"
 version = "0.1.0"
 dependencies = [
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-s3",
  "aws-smithy-types",
  "hex",
