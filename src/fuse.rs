@@ -183,7 +183,6 @@ impl<S: Storage + Send + Sync + 'static> MerkleFuse<S> {
             MountOption::RW,
             MountOption::FSName("merkle-drive".to_string()),
             MountOption::AutoUnmount,
-            MountOption::AllowOther,
         ];
         fuser::spawn_mount2(self, mountpoint, &options)
     }
