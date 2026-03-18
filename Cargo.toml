@@ -16,6 +16,8 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+fuser = "0.14"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

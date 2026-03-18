@@ -3,6 +3,7 @@
 pub mod canonical;
 pub mod commit;
 pub mod error;
+pub mod fuse;
 pub mod hash;
 pub mod storage;
 pub mod tree;
