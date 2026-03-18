@@ -4,8 +4,8 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 
 use crate::commit::Commit;
@@ -55,15 +55,13 @@ impl Inode {
                 let perm = if self.exec { 0o755 } else { 0o644 };
                 (FileType::RegularFile, data.len() as u64, perm)
             }
-            InodeKind::Symlink { target } => {
-                (FileType::Symlink, target.len() as u64, 0o777)
-            }
+            InodeKind::Symlink { target } => (FileType::Symlink, target.len() as u64, 0o777),
         };
 
         FileAttr {
             ino,
             size,
-            blocks: (size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64,
+            blocks: size.div_ceil(BLOCK_SIZE as u64),
             atime: self.mtime,
             mtime: self.mtime,
             ctime: self.ctime,
@@ -641,9 +639,7 @@ impl<S: Storage + Send + Sync + 'static> Filesystem for MerkleFuse<S> {
     ) {
         let name_str = name.to_str().unwrap_or("").to_string();
 
-        if let Some(InodeKind::Directory { children }) =
-            self.inodes.get(&parent).map(|i| &i.kind)
-        {
+        if let Some(InodeKind::Directory { children }) = self.inodes.get(&parent).map(|i| &i.kind) {
             if children.contains_key(&name_str) {
                 reply.error(libc::EEXIST);
                 return;
@@ -781,9 +777,7 @@ impl<S: Storage + Send + Sync + 'static> Filesystem for MerkleFuse<S> {
         let name_str = link_name.to_str().unwrap_or("").to_string();
         let target_str = target.to_str().unwrap_or("").to_string();
 
-        if let Some(InodeKind::Directory { children }) =
-            self.inodes.get(&parent).map(|i| &i.kind)
-        {
+        if let Some(InodeKind::Directory { children }) = self.inodes.get(&parent).map(|i| &i.kind) {
             if children.contains_key(&name_str) {
                 reply.error(libc::EEXIST);
                 return;
@@ -802,9 +796,7 @@ impl<S: Storage + Send + Sync + 'static> Filesystem for MerkleFuse<S> {
             Inode {
                 parent,
                 name: name_str.clone(),
-                kind: InodeKind::Symlink {
-                    target: target_str,
-                },
+                kind: InodeKind::Symlink { target: target_str },
                 uid: req.uid(),
                 gid: req.gid(),
                 mtime: now,
@@ -858,14 +850,10 @@ impl<S: Storage + Send + Sync + 'static> Filesystem for MerkleFuse<S> {
         }
 
         // Remove any existing entry at destination
-        if let Some(old_ino) = self
-            .inodes
-            .get(&newparent)
-            .and_then(|i| match &i.kind {
-                InodeKind::Directory { children } => children.get(&newname_str).copied(),
-                _ => None,
-            })
-        {
+        if let Some(old_ino) = self.inodes.get(&newparent).and_then(|i| match &i.kind {
+            InodeKind::Directory { children } => children.get(&newname_str).copied(),
+            _ => None,
+        }) {
             self.inodes.remove(&old_ino);
         }
 
@@ -975,9 +963,7 @@ impl<S: Storage + Send + Sync + 'static> Filesystem for MerkleFuse<S> {
     ) {
         let name_str = name.to_str().unwrap_or("").to_string();
 
-        if let Some(InodeKind::Directory { children }) =
-            self.inodes.get(&parent).map(|i| &i.kind)
-        {
+        if let Some(InodeKind::Directory { children }) = self.inodes.get(&parent).map(|i| &i.kind) {
             if children.contains_key(&name_str) {
                 reply.error(libc::EEXIST);
                 return;
@@ -1100,7 +1086,7 @@ impl<S: Storage + Send + Sync + 'static> Filesystem for MerkleFuse<S> {
         }
 
         for (i, (entry_ino, ft, name)) in entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(*entry_ino, (i + 1) as i64, *ft, &name) {
+            if reply.add(*entry_ino, (i + 1) as i64, *ft, name) {
                 break;
             }
         }

@@ -545,10 +545,7 @@ async fn test_fuse_symlink() {
     })
     .await;
 
-    assert_eq!(
-        link_target,
-        std::path::PathBuf::from("target.txt")
-    );
+    assert_eq!(link_target, std::path::PathBuf::from("target.txt"));
     assert_eq!(content, b"target content");
 
     mount.unmount();
