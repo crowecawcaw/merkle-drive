@@ -11,7 +11,7 @@ use fuser::{
 use crate::commit::Commit;
 use crate::error::MerkleError;
 use crate::hash;
-use crate::storage::Storage;
+use crate::storage::S3Storage;
 use crate::tree::*;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -108,8 +108,8 @@ enum PendingKind {
 
 // === Public API ===
 
-pub struct MerkleFuse<S> {
-    storage: S,
+pub struct MerkleFuse {
+    storage: S3Storage,
     rt: tokio::runtime::Handle,
     branch: String,
     client_id: String,
@@ -120,11 +120,11 @@ pub struct MerkleFuse<S> {
     parent_commit_hash: Option<[u8; 32]>,
 }
 
-impl<S: Storage + Send + Sync + 'static> MerkleFuse<S> {
+impl MerkleFuse {
     /// Create a new FUSE filesystem backed by the given storage.
     /// Loads the current tree from HEAD if it exists.
     pub async fn new(
-        storage: S,
+        storage: S3Storage,
         rt: tokio::runtime::Handle,
         branch: String,
         client_id: String,
@@ -299,8 +299,8 @@ impl<S: Storage + Send + Sync + 'static> MerkleFuse<S> {
 // === Tree loading helpers ===
 
 /// Load a directory tree from storage into the inode table (iterative BFS).
-async fn load_tree_from_storage<S: Storage>(
-    storage: &S,
+async fn load_tree_from_storage(
+    storage: &S3Storage,
     root_hash: &str,
     root_ino: u64,
     inodes: &mut BTreeMap<u64, Inode>,
@@ -416,8 +416,8 @@ fn add_child_to_parent(
 }
 
 /// Flatten a B-tree node into all leaf entries (handles interior nodes iteratively).
-async fn collect_all_leaf_entries<S: Storage>(
-    storage: &S,
+async fn collect_all_leaf_entries(
+    storage: &S3Storage,
     node_hash: &str,
 ) -> crate::error::Result<Vec<LeafEntry>> {
     let mut entries = Vec::new();
@@ -437,7 +437,7 @@ async fn collect_all_leaf_entries<S: Storage>(
     Ok(entries)
 }
 
-async fn load_file_content<S: Storage>(storage: &S, entry: &LeafEntry) -> Vec<u8> {
+async fn load_file_content(storage: &S3Storage, entry: &LeafEntry) -> Vec<u8> {
     match &entry.content {
         Some(FileContent::Inline(data)) => data.clone(),
         Some(FileContent::Blocks(blocks)) => {
@@ -533,7 +533,7 @@ fn collect_dirs_recursive(
 
 // === Filesystem trait implementation ===
 
-impl<S: Storage + Send + Sync + 'static> Filesystem for MerkleFuse<S> {
+impl Filesystem for MerkleFuse {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(s) => s,

@@ -5,200 +5,15 @@
 //! nodes, committing snapshots, reading them back, and testing multi-client
 //! sync scenarios with CAS conflict handling.
 
+mod common;
+
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use merkle_drive::commit::Commit;
 use merkle_drive::hash;
-use merkle_drive::storage::{S3Storage, Storage};
 use merkle_drive::tree::*;
 
-use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
-
-const DATA_BUCKET: &str = "merkle-data";
-const META_BUCKET: &str = "merkle-meta";
-
-/// Start a RustFS container and return an S3Storage connected to it.
-async fn start_rustfs_drive() -> (S3Storage, testcontainers::ContainerAsync<GenericImage>) {
-    let container = GenericImage::new("rustfs/rustfs", "latest")
-        .with_exposed_port(9000.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Starting:"))
-        .with_env_var("RUSTFS_ACCESS_KEY", "testuser")
-        .with_env_var("RUSTFS_SECRET_KEY", "testpassword")
-        .start()
-        .await
-        .expect("failed to start RustFS container");
-
-    // Give RustFS a moment to fully initialize after the startup message
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-    let port = container
-        .get_host_port_ipv4(9000)
-        .await
-        .expect("failed to get mapped port");
-
-    let endpoint = format!("http://127.0.0.1:{port}");
-
-    let creds =
-        aws_credential_types::Credentials::new("testuser", "testpassword", None, None, "test");
-
-    let config = aws_sdk_s3::Config::builder()
-        .endpoint_url(&endpoint)
-        .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .credentials_provider(creds)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-
-    let client = aws_sdk_s3::Client::from_conf(config);
-
-    // Create the two buckets
-    client
-        .create_bucket()
-        .bucket(DATA_BUCKET)
-        .send()
-        .await
-        .expect("failed to create data bucket");
-
-    client
-        .create_bucket()
-        .bucket(META_BUCKET)
-        .send()
-        .await
-        .expect("failed to create metadata bucket");
-
-    let storage = S3Storage::new(client, DATA_BUCKET.to_string(), META_BUCKET.to_string());
-
-    (storage, container)
-}
-
-/// Build a second S3Storage client pointing at the same RustFS container.
-fn connect_second_client(port: u16) -> S3Storage {
-    let endpoint = format!("http://127.0.0.1:{port}");
-
-    let creds =
-        aws_credential_types::Credentials::new("testuser", "testpassword", None, None, "test");
-
-    let config = aws_sdk_s3::Config::builder()
-        .endpoint_url(&endpoint)
-        .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .credentials_provider(creds)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-
-    let client = aws_sdk_s3::Client::from_conf(config);
-
-    S3Storage::new(client, DATA_BUCKET.to_string(), META_BUCKET.to_string())
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
-
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-}
-
-fn make_leaf(entries: Vec<LeafEntry>) -> TreeNode {
-    TreeNode::Leaf(LeafNode { entries })
-}
-
-fn inline_file(name: &str, data: &[u8]) -> LeafEntry {
-    let ts = now_ns();
-    LeafEntry::file(
-        name.to_string(),
-        data.len() as u64,
-        FileContent::Inline(data.to_vec()),
-        ts,
-        ts,
-        1000,
-        1000,
-        false,
-    )
-}
-
-/// Helper: write a file as a blob, build a single-file root tree, commit it,
-/// and return (root_hash_hex, etag).
-#[allow(clippy::too_many_arguments)]
-async fn write_single_file(
-    storage: &S3Storage,
-    branch: &str,
-    filename: &str,
-    content: &[u8],
-    parent_commit_hash: Option<[u8; 32]>,
-    expected_etag: Option<&str>,
-    client_id: &str,
-    message: &str,
-) -> (String, String) {
-    let blob_hash_hex = storage.put_blob(content).await.unwrap();
-    let blob_hash = hash::hex_decode(&blob_hash_hex).unwrap();
-
-    let root = make_leaf(vec![LeafEntry::file(
-        filename.to_string(),
-        content.len() as u64,
-        FileContent::Blocks(vec![blob_hash]),
-        now_ns(),
-        now_ns(),
-        1000,
-        1000,
-        false,
-    )]);
-
-    let root_hex = storage.put_node(&root).await.unwrap();
-    let root_hash = hash::hex_decode(&root_hex).unwrap();
-
-    let commit = Commit::new(
-        root_hash,
-        parent_commit_hash,
-        client_id.to_string(),
-        now_ms(),
-        message.to_string(),
-    );
-
-    let etag = storage
-        .put_head(branch, &commit, expected_etag)
-        .await
-        .unwrap();
-
-    (root_hex, etag)
-}
-
-/// Read a file's blob content by navigating HEAD -> root tree -> entry -> blob.
-async fn read_file(storage: &S3Storage, branch: &str, filename: &str) -> Vec<u8> {
-    let (commit, _etag) = storage
-        .get_head(branch)
-        .await
-        .unwrap()
-        .expect("branch HEAD should exist");
-
-    let root = storage.get_node(&commit.root).await.unwrap();
-
-    match root.lookup_local(filename) {
-        LookupResult::Found(entry) => match &entry.content {
-            Some(FileContent::Inline(data)) => data.clone(),
-            Some(FileContent::Blocks(blocks)) => {
-                let mut result = Vec::new();
-                for block in blocks {
-                    let hex = hash::hex_encode(block);
-                    let data = storage.get_blob(&hex).await.unwrap();
-                    result.extend_from_slice(&data);
-                }
-                result
-            }
-            None => panic!("file entry has no content"),
-        },
-        other => panic!("expected Found for {filename}, got {other:?}"),
-    }
-}
+use common::*;
 
 // ============================================================
 // Integration tests
@@ -206,7 +21,8 @@ async fn read_file(storage: &S3Storage, branch: &str, filename: &str) -> Vec<u8>
 
 #[tokio::test]
 async fn test_write_and_read_single_file() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     let content = b"hello from merkle-drive integration test!";
 
@@ -228,7 +44,8 @@ async fn test_write_and_read_single_file() {
 
 #[tokio::test]
 async fn test_write_read_inline_file() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     // Inline content (small, stored directly in tree node)
     let small_data = b"tiny";
@@ -251,7 +68,8 @@ async fn test_write_read_inline_file() {
 
 #[tokio::test]
 async fn test_overwrite_file_new_commit() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     let (_, etag1) = write_single_file(
         &storage,
@@ -293,7 +111,8 @@ async fn test_overwrite_file_new_commit() {
 
 #[tokio::test]
 async fn test_nested_directories() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     // Build src/main.rs
     let main_rs = b"fn main() { println!(\"hello\"); }";
@@ -407,9 +226,8 @@ async fn test_nested_directories() {
 
 #[tokio::test]
 async fn test_two_clients_sync_via_head_poll() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    let storage2 = connect_second_client(port);
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
 
     // Client 1 writes a file
     write_single_file(
@@ -435,9 +253,8 @@ async fn test_two_clients_sync_via_head_poll() {
 
 #[tokio::test]
 async fn test_cas_conflict_between_clients() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    let storage2 = connect_second_client(port);
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
 
     // Both clients see the initial state
     let (_, etag1) = write_single_file(
@@ -509,9 +326,8 @@ async fn test_cas_conflict_between_clients() {
 
 #[tokio::test]
 async fn test_cas_retry_after_conflict() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    let storage2 = connect_second_client(port);
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
 
     // Initial commit
     let (_, etag1) = write_single_file(
@@ -609,9 +425,8 @@ async fn test_cas_retry_after_conflict() {
 
 #[tokio::test]
 async fn test_content_dedup_across_clients() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    let storage2 = connect_second_client(port);
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
 
     let content = b"shared content blob";
 
@@ -629,7 +444,8 @@ async fn test_content_dedup_across_clients() {
 
 #[tokio::test]
 async fn test_multi_file_directory() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     // Write multiple blobs
     let files: Vec<(&str, &[u8])> = vec![
@@ -676,7 +492,8 @@ async fn test_multi_file_directory() {
 
 #[tokio::test]
 async fn test_multiple_branches_independent() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     // Write to "main"
     write_single_file(
@@ -720,7 +537,8 @@ async fn test_multiple_branches_independent() {
 
 #[tokio::test]
 async fn test_large_file_multiple_blocks() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     // Simulate a large file split into multiple blocks
     let block1 = vec![0xAA_u8; 4096];
@@ -769,7 +587,8 @@ async fn test_large_file_multiple_blocks() {
 
 #[tokio::test]
 async fn test_symlink_and_executable() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     let root = make_leaf(vec![
         LeafEntry::file(
@@ -827,7 +646,8 @@ async fn test_symlink_and_executable() {
 
 #[tokio::test]
 async fn test_sequential_commits_history() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     // Build a chain of 5 commits
     let mut parent_hash: Option<[u8; 32]> = None;
@@ -881,9 +701,8 @@ async fn test_sequential_commits_history() {
 
 #[tokio::test]
 async fn test_client2_sees_updates_after_poll() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    let storage2 = connect_second_client(port);
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
 
     // Client 2 sees no HEAD initially
     let head = storage2.get_head("main").await.unwrap();
@@ -938,7 +757,8 @@ async fn test_client2_sees_updates_after_poll() {
 
 #[tokio::test]
 async fn test_blob_exists_check() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     let hex = storage.put_blob(b"existence check").await.unwrap();
     assert!(storage.blob_exists(&hex).await.unwrap());
@@ -950,7 +770,8 @@ async fn test_blob_exists_check() {
 
 #[tokio::test]
 async fn test_node_exists_check() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     let node = make_leaf(vec![inline_file("test.txt", b"data")]);
     let hex = storage.put_node(&node).await.unwrap();
@@ -962,9 +783,8 @@ async fn test_node_exists_check() {
 
 #[tokio::test]
 async fn test_concurrent_writes_to_separate_branches() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    let storage2 = connect_second_client(port);
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
 
     let storage = Arc::new(storage);
     let storage2 = Arc::new(storage2);
@@ -1034,7 +854,8 @@ async fn test_concurrent_writes_to_separate_branches() {
 
 #[tokio::test]
 async fn test_immutable_snapshots_preserved() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
 
     // Commit v1
     let blob1_hex = storage.put_blob(b"snapshot v1").await.unwrap();

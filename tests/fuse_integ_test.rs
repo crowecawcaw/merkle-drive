@@ -5,246 +5,26 @@
 //! standard filesystem operations, then verifying that data persists correctly
 //! in the S3-backed storage.
 
+mod common;
+
 use std::os::unix::fs::symlink as unix_symlink;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use merkle_drive::commit::Commit;
-use merkle_drive::fuse::MerkleFuse;
 use merkle_drive::hash;
-use merkle_drive::storage::{S3Storage, Storage};
 use merkle_drive::tree::*;
 
-use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
-
-const DATA_BUCKET: &str = "merkle-data";
-const META_BUCKET: &str = "merkle-meta";
+use common::*;
 
 // ============================================================
-// Container / client helpers (shared with rustfs_integ_test.rs)
-// ============================================================
-
-async fn start_rustfs_drive() -> (S3Storage, testcontainers::ContainerAsync<GenericImage>) {
-    let container = GenericImage::new("rustfs/rustfs", "latest")
-        .with_exposed_port(9000.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Starting:"))
-        .with_env_var("RUSTFS_ACCESS_KEY", "testuser")
-        .with_env_var("RUSTFS_SECRET_KEY", "testpassword")
-        .start()
-        .await
-        .expect("failed to start RustFS container");
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let port = container
-        .get_host_port_ipv4(9000)
-        .await
-        .expect("failed to get mapped port");
-
-    let endpoint = format!("http://127.0.0.1:{port}");
-
-    let creds =
-        aws_credential_types::Credentials::new("testuser", "testpassword", None, None, "test");
-
-    let config = aws_sdk_s3::Config::builder()
-        .endpoint_url(&endpoint)
-        .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .credentials_provider(creds)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-
-    let client = aws_sdk_s3::Client::from_conf(config);
-
-    client
-        .create_bucket()
-        .bucket(DATA_BUCKET)
-        .send()
-        .await
-        .expect("failed to create data bucket");
-
-    client
-        .create_bucket()
-        .bucket(META_BUCKET)
-        .send()
-        .await
-        .expect("failed to create metadata bucket");
-
-    let storage = S3Storage::new(client, DATA_BUCKET.to_string(), META_BUCKET.to_string());
-
-    (storage, container)
-}
-
-fn connect_second_client(port: u16) -> S3Storage {
-    let endpoint = format!("http://127.0.0.1:{port}");
-
-    let creds =
-        aws_credential_types::Credentials::new("testuser", "testpassword", None, None, "test");
-
-    let config = aws_sdk_s3::Config::builder()
-        .endpoint_url(&endpoint)
-        .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .credentials_provider(creds)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-
-    let client = aws_sdk_s3::Client::from_conf(config);
-
-    S3Storage::new(client, DATA_BUCKET.to_string(), META_BUCKET.to_string())
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
-
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-}
-
-fn make_leaf(entries: Vec<LeafEntry>) -> TreeNode {
-    TreeNode::Leaf(LeafNode { entries })
-}
-
-/// Read a file's blob content by navigating HEAD -> root tree -> entry -> blob.
-async fn read_file(storage: &S3Storage, branch: &str, filename: &str) -> Vec<u8> {
-    let (commit, _etag) = storage
-        .get_head(branch)
-        .await
-        .unwrap()
-        .expect("branch HEAD should exist");
-
-    let root = storage.get_node(&commit.root).await.unwrap();
-
-    match root.lookup_local(filename) {
-        LookupResult::Found(entry) => match &entry.content {
-            Some(FileContent::Inline(data)) => data.clone(),
-            Some(FileContent::Blocks(blocks)) => {
-                let mut result = Vec::new();
-                for block in blocks {
-                    let hex = hash::hex_encode(block);
-                    let data = storage.get_blob(&hex).await.unwrap();
-                    result.extend_from_slice(&data);
-                }
-                result
-            }
-            None => panic!("file entry has no content"),
-        },
-        other => panic!("expected Found for {filename}, got {other:?}"),
-    }
-}
-
-/// Navigate into a subdirectory and read a file from it.
-async fn read_nested_file(
-    storage: &S3Storage,
-    branch: &str,
-    dir_name: &str,
-    filename: &str,
-) -> Vec<u8> {
-    let (commit, _) = storage
-        .get_head(branch)
-        .await
-        .unwrap()
-        .expect("branch HEAD should exist");
-
-    let root = storage.get_node(&commit.root).await.unwrap();
-
-    match root.lookup_local(dir_name) {
-        LookupResult::Found(entry) => {
-            assert_eq!(entry.entry_type, EntryType::Dir);
-            let dir_node = storage
-                .get_node(&hash::hex_encode(&entry.hash.unwrap()))
-                .await
-                .unwrap();
-
-            match dir_node.lookup_local(filename) {
-                LookupResult::Found(file_entry) => match &file_entry.content {
-                    Some(FileContent::Inline(data)) => data.clone(),
-                    Some(FileContent::Blocks(blocks)) => {
-                        let mut result = Vec::new();
-                        for block in blocks {
-                            let hex = hash::hex_encode(block);
-                            let data = storage.get_blob(&hex).await.unwrap();
-                            result.extend_from_slice(&data);
-                        }
-                        result
-                    }
-                    None => panic!("file entry has no content"),
-                },
-                other => panic!("expected Found for {filename}, got {other:?}"),
-            }
-        }
-        other => panic!("expected Found for {dir_name}, got {other:?}"),
-    }
-}
-
-// ============================================================
-// FUSE mount helper
-// ============================================================
-
-struct FuseMount {
-    session: Option<fuser::BackgroundSession>,
-    mount_dir: tempfile::TempDir,
-}
-
-impl FuseMount {
-    async fn new(storage: S3Storage, branch: &str) -> Self {
-        let mount_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let rt = tokio::runtime::Handle::current();
-        let fs = MerkleFuse::new(storage, rt, branch.to_string(), "fuse-test".to_string()).await;
-        let session = fs
-            .mount(mount_dir.path())
-            .expect("failed to mount FUSE filesystem");
-
-        // Give FUSE time to be ready
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        Self {
-            session: Some(session),
-            mount_dir,
-        }
-    }
-
-    fn path(&self) -> PathBuf {
-        self.mount_dir.path().to_owned()
-    }
-
-    fn unmount(&mut self) {
-        self.session.take(); // Drop the session to unmount
-    }
-}
-
-impl Drop for FuseMount {
-    fn drop(&mut self) {
-        self.session.take();
-    }
-}
-
-/// Run a blocking filesystem operation on a separate thread to avoid
-/// blocking the tokio runtime.
-async fn blocking<F, T>(f: F) -> T
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f).await.unwrap()
-}
-
-// ============================================================
-// Integration tests
+// Existing integration tests (refactored to use common::*)
 // ============================================================
 
 #[tokio::test]
 async fn test_fuse_write_and_read_file() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
     let mut mount = FuseMount::new(storage, "main").await;
     let mp = mount.path();
 
@@ -266,8 +46,8 @@ async fn test_fuse_write_and_read_file() {
 
 #[tokio::test]
 async fn test_fuse_data_persists_to_storage() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
     let mut mount = FuseMount::new(storage, "main").await;
     let mp = mount.path();
 
@@ -283,15 +63,14 @@ async fn test_fuse_data_persists_to_storage() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Verify via library using a second client
-    let storage2 = connect_second_client(port);
     let data = read_file(&storage2, "main", "persisted.txt").await;
     assert_eq!(data, b"this should persist");
 }
 
 #[tokio::test]
 async fn test_fuse_read_preexisting_data() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
 
     // Write data via library API
     let blob_hex = storage.put_blob(b"pre-existing content").await.unwrap();
@@ -318,7 +97,6 @@ async fn test_fuse_read_preexisting_data() {
     storage.put_head("main", &commit, None).await.unwrap();
 
     // Mount FUSE with a fresh client (to prove it loads from storage)
-    let storage2 = connect_second_client(port);
     let mut mount = FuseMount::new(storage2, "main").await;
     let mp = mount.path();
 
@@ -333,8 +111,8 @@ async fn test_fuse_read_preexisting_data() {
 
 #[tokio::test]
 async fn test_fuse_multiple_files() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
     let mut mount = FuseMount::new(storage, "main").await;
     let mp = mount.path();
 
@@ -378,7 +156,6 @@ async fn test_fuse_multiple_files() {
     mount.unmount();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let storage2 = connect_second_client(port);
     let a = read_file(&storage2, "main", "alpha.txt").await;
     let b = read_file(&storage2, "main", "beta.txt").await;
     let g = read_file(&storage2, "main", "gamma.txt").await;
@@ -389,8 +166,8 @@ async fn test_fuse_multiple_files() {
 
 #[tokio::test]
 async fn test_fuse_nested_directories() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
     let mut mount = FuseMount::new(storage, "main").await;
     let mp = mount.path();
 
@@ -424,7 +201,6 @@ async fn test_fuse_nested_directories() {
     mount.unmount();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let storage2 = connect_second_client(port);
     let main_rs = read_nested_file(&storage2, "main", "src", "main.rs").await;
     let readme = read_nested_file(&storage2, "main", "docs", "readme.md").await;
     let cargo = read_file(&storage2, "main", "Cargo.toml").await;
@@ -436,8 +212,8 @@ async fn test_fuse_nested_directories() {
 
 #[tokio::test]
 async fn test_fuse_overwrite_file() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
     let mut mount = FuseMount::new(storage, "main").await;
     let mp = mount.path();
 
@@ -469,15 +245,14 @@ async fn test_fuse_overwrite_file() {
     mount.unmount();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let storage2 = connect_second_client(port);
     let data = read_file(&storage2, "main", "data.txt").await;
     assert_eq!(data, b"version 2");
 }
 
 #[tokio::test]
 async fn test_fuse_delete_file() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
     let mut mount = FuseMount::new(storage, "main").await;
     let mp = mount.path();
 
@@ -507,7 +282,6 @@ async fn test_fuse_delete_file() {
     mount.unmount();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let storage2 = connect_second_client(port);
     let (commit, _) = storage2.get_head("main").await.unwrap().unwrap();
     let root = storage2.get_node(&commit.root).await.unwrap();
 
@@ -525,7 +299,8 @@ async fn test_fuse_delete_file() {
 
 #[tokio::test]
 async fn test_fuse_symlink() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
     let mut mount = FuseMount::new(storage, "main").await;
     let mp = mount.path();
 
@@ -553,8 +328,8 @@ async fn test_fuse_symlink() {
 
 #[tokio::test]
 async fn test_fuse_large_file() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
     let mut mount = FuseMount::new(storage, "main").await;
     let mp = mount.path();
 
@@ -577,14 +352,14 @@ async fn test_fuse_large_file() {
     mount.unmount();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let storage2 = connect_second_client(port);
     let data = read_file(&storage2, "main", "large.bin").await;
     assert_eq!(data, expected);
 }
 
 #[tokio::test]
 async fn test_fuse_rmdir() {
-    let (storage, _container) = start_rustfs_drive().await;
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
     let mut mount = FuseMount::new(storage, "main").await;
     let mp = mount.path();
 
@@ -608,8 +383,8 @@ async fn test_fuse_rmdir() {
 
 #[tokio::test]
 async fn test_fuse_read_preexisting_nested() {
-    let (storage, container) = start_rustfs_drive().await;
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
 
     // Build a nested tree via library API: root -> src/ -> lib.rs
     let lib_content = b"pub fn hello() {}";
@@ -655,7 +430,6 @@ async fn test_fuse_read_preexisting_nested() {
     storage.put_head("main", &commit, None).await.unwrap();
 
     // Mount with a fresh client and read via FUSE
-    let storage2 = connect_second_client(port);
     let mut mount = FuseMount::new(storage2, "main").await;
     let mp = mount.path();
 
@@ -672,4 +446,428 @@ async fn test_fuse_read_preexisting_nested() {
     assert_eq!(results.1, b"pub fn hello() {}");
 
     mount.unmount();
+}
+
+// ============================================================
+// New error path tests
+// ============================================================
+
+#[tokio::test]
+async fn test_fuse_rmdir_nonempty() {
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
+    let mut mount = FuseMount::new(storage, "main").await;
+    let mp = mount.path();
+
+    let mp2 = mp.clone();
+    let err = blocking(move || {
+        std::fs::create_dir(mp2.join("mydir")).unwrap();
+        std::fs::write(mp2.join("mydir").join("child.txt"), b"content").unwrap();
+        // Try to rmdir without removing the file first
+        std::fs::remove_dir(mp2.join("mydir")).unwrap_err()
+    })
+    .await;
+
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ENOTEMPTY),
+        "rmdir on non-empty dir should return ENOTEMPTY, got: {err}"
+    );
+
+    mount.unmount();
+}
+
+#[tokio::test]
+async fn test_fuse_unlink_nonexistent() {
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
+    let mut mount = FuseMount::new(storage, "main").await;
+    let mp = mount.path();
+
+    let mp2 = mp.clone();
+    let err = blocking(move || std::fs::remove_file(mp2.join("ghost.txt")).unwrap_err()).await;
+
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ENOENT),
+        "unlink on nonexistent file should return ENOENT, got: {err}"
+    );
+
+    mount.unmount();
+}
+
+#[tokio::test]
+async fn test_fuse_rename_same_dir() {
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
+    let mut mount = FuseMount::new(storage, "main").await;
+    let mp = mount.path();
+
+    let mp2 = mp.clone();
+    blocking(move || {
+        std::fs::write(mp2.join("old_name.txt"), b"rename me").unwrap();
+        std::fs::rename(mp2.join("old_name.txt"), mp2.join("new_name.txt")).unwrap();
+    })
+    .await;
+
+    // Old name should be gone
+    let mp2 = mp.clone();
+    let old_exists = blocking(move || mp2.join("old_name.txt").exists()).await;
+    assert!(!old_exists, "old_name.txt should not exist after rename");
+
+    // New name should have the content
+    let mp2 = mp.clone();
+    let content = blocking(move || std::fs::read(mp2.join("new_name.txt")).unwrap()).await;
+    assert_eq!(content, b"rename me");
+
+    mount.unmount();
+}
+
+#[tokio::test]
+async fn test_fuse_rename_across_dirs() {
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
+    let mut mount = FuseMount::new(storage, "main").await;
+    let mp = mount.path();
+
+    let mp2 = mp.clone();
+    blocking(move || {
+        std::fs::create_dir(mp2.join("dir_a")).unwrap();
+        std::fs::create_dir(mp2.join("dir_b")).unwrap();
+        std::fs::write(mp2.join("dir_a").join("moved.txt"), b"cross-dir data").unwrap();
+        std::fs::rename(
+            mp2.join("dir_a").join("moved.txt"),
+            mp2.join("dir_b").join("moved.txt"),
+        )
+        .unwrap();
+    })
+    .await;
+
+    // Should be gone from dir_a
+    let mp2 = mp.clone();
+    let old_exists = blocking(move || mp2.join("dir_a").join("moved.txt").exists()).await;
+    assert!(!old_exists, "file should not exist in dir_a after rename");
+
+    // Should be present in dir_b
+    let mp2 = mp.clone();
+    let content =
+        blocking(move || std::fs::read(mp2.join("dir_b").join("moved.txt")).unwrap()).await;
+    assert_eq!(content, b"cross-dir data");
+
+    mount.unmount();
+}
+
+#[tokio::test]
+async fn test_fuse_rename_overwrite() {
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
+    let mut mount = FuseMount::new(storage, "main").await;
+    let mp = mount.path();
+
+    let mp2 = mp.clone();
+    blocking(move || {
+        std::fs::write(mp2.join("src.txt"), b"new content").unwrap();
+        std::fs::write(mp2.join("dst.txt"), b"old content").unwrap();
+        // Rename src onto dst, should replace dst
+        std::fs::rename(mp2.join("src.txt"), mp2.join("dst.txt")).unwrap();
+    })
+    .await;
+
+    // src should be gone
+    let mp2 = mp.clone();
+    let src_exists = blocking(move || mp2.join("src.txt").exists()).await;
+    assert!(!src_exists, "src.txt should not exist after rename");
+
+    // dst should have the new content
+    let mp2 = mp.clone();
+    let content = blocking(move || std::fs::read(mp2.join("dst.txt")).unwrap()).await;
+    assert_eq!(content, b"new content");
+
+    mount.unmount();
+}
+
+// ============================================================
+// New happy path / boundary tests
+// ============================================================
+
+#[tokio::test]
+async fn test_fuse_empty_file() {
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
+    let mut mount = FuseMount::new(storage, "main").await;
+    let mp = mount.path();
+
+    // Write a 0-byte file
+    let mp2 = mp.clone();
+    blocking(move || {
+        std::fs::write(mp2.join("empty.txt"), b"").unwrap();
+    })
+    .await;
+
+    // Read it back via FUSE
+    let mp2 = mp.clone();
+    let content = blocking(move || std::fs::read(mp2.join("empty.txt")).unwrap()).await;
+    assert_eq!(content, b"");
+
+    // Check metadata shows size 0
+    let mp2 = mp.clone();
+    let size = blocking(move || std::fs::metadata(mp2.join("empty.txt")).unwrap().len()).await;
+    assert_eq!(size, 0);
+
+    // Unmount and verify persistence
+    mount.unmount();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let data = read_file(&storage2, "main", "empty.txt").await;
+    assert_eq!(data, b"");
+}
+
+#[tokio::test]
+async fn test_fuse_file_at_inline_threshold() {
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
+    let mut mount = FuseMount::new(storage, "main").await;
+    let mp = mount.path();
+
+    // Exactly 128 bytes - should be stored inline on commit
+    let data_128: Vec<u8> = (0..128).map(|i| (i % 256) as u8).collect();
+    let expected = data_128.clone();
+
+    let mp2 = mp.clone();
+    blocking(move || {
+        std::fs::write(mp2.join("inline.bin"), &data_128).unwrap();
+    })
+    .await;
+
+    // Read back via FUSE
+    let mp2 = mp.clone();
+    let content = blocking(move || std::fs::read(mp2.join("inline.bin")).unwrap()).await;
+    assert_eq!(content, expected);
+
+    // Unmount and verify persistence
+    mount.unmount();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let data = read_file(&storage2, "main", "inline.bin").await;
+    assert_eq!(data.len(), 128);
+    assert_eq!(data, expected);
+}
+
+#[tokio::test]
+async fn test_fuse_file_above_inline_threshold() {
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
+    let mut mount = FuseMount::new(storage, "main").await;
+    let mp = mount.path();
+
+    // 129 bytes - should use blocks on commit
+    let data_129: Vec<u8> = (0..129).map(|i| (i % 256) as u8).collect();
+    let expected = data_129.clone();
+
+    let mp2 = mp.clone();
+    blocking(move || {
+        std::fs::write(mp2.join("blocks.bin"), &data_129).unwrap();
+    })
+    .await;
+
+    // Read back via FUSE
+    let mp2 = mp.clone();
+    let content = blocking(move || std::fs::read(mp2.join("blocks.bin")).unwrap()).await;
+    assert_eq!(content, expected);
+
+    // Unmount and verify persistence
+    mount.unmount();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let data = read_file(&storage2, "main", "blocks.bin").await;
+    assert_eq!(data.len(), 129);
+    assert_eq!(data, expected);
+}
+
+#[tokio::test]
+async fn test_fuse_deeply_nested_dirs() {
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
+    let mut mount = FuseMount::new(storage, "main").await;
+    let mp = mount.path();
+
+    // Create 10 levels deep: a/b/c/d/e/f/g/h/i/j/file.txt
+    let mp2 = mp.clone();
+    blocking(move || {
+        let mut path = mp2.clone();
+        for dir in &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] {
+            path = path.join(dir);
+            std::fs::create_dir(&path).unwrap();
+        }
+        std::fs::write(path.join("file.txt"), b"deep content").unwrap();
+    })
+    .await;
+
+    // Read back via FUSE
+    let mp2 = mp.clone();
+    let content = blocking(move || {
+        std::fs::read(
+            mp2.join("a")
+                .join("b")
+                .join("c")
+                .join("d")
+                .join("e")
+                .join("f")
+                .join("g")
+                .join("h")
+                .join("i")
+                .join("j")
+                .join("file.txt"),
+        )
+        .unwrap()
+    })
+    .await;
+    assert_eq!(content, b"deep content");
+
+    mount.unmount();
+}
+
+#[tokio::test]
+async fn test_fuse_executable_permission() {
+    let container = RustfsContainer::start().await;
+    let (storage, storage2) = container.new_storage_pair().await;
+    let mut mount = FuseMount::new(storage, "main").await;
+    let mp = mount.path();
+
+    let mp2 = mp.clone();
+    blocking(move || {
+        std::fs::write(mp2.join("script.sh"), b"#!/bin/sh\necho hello").unwrap();
+        let mut perms = std::fs::metadata(mp2.join("script.sh")).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(mp2.join("script.sh"), perms).unwrap();
+    })
+    .await;
+
+    // Verify permission via FUSE
+    let mp2 = mp.clone();
+    let mode = blocking(move || {
+        std::fs::metadata(mp2.join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+    })
+    .await;
+    // Check executable bit is set (at least user execute)
+    assert!(
+        mode & 0o100 != 0,
+        "executable bit should be set, got mode: {mode:#o}"
+    );
+
+    // Unmount and verify persistence: the exec flag should survive commit
+    mount.unmount();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (commit, _) = storage2.get_head("main").await.unwrap().unwrap();
+    let root_node = storage2.get_node(&commit.root).await.unwrap();
+    match root_node.lookup_local("script.sh") {
+        LookupResult::Found(entry) => {
+            assert!(entry.exec, "script.sh should be marked executable after commit");
+        }
+        other => panic!("expected Found for script.sh, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_fuse_empty_dir_readdir() {
+    let container = RustfsContainer::start().await;
+    let storage = container.new_storage().await;
+    let mut mount = FuseMount::new(storage, "main").await;
+    let mp = mount.path();
+
+    let mp2 = mp.clone();
+    blocking(move || {
+        std::fs::create_dir(mp2.join("emptydir")).unwrap();
+    })
+    .await;
+
+    // readdir on empty dir should return only "." and ".."
+    let mp2 = mp.clone();
+    let entries: Vec<String> = blocking(move || {
+        std::fs::read_dir(mp2.join("emptydir"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+            .collect()
+    })
+    .await;
+
+    // std::fs::read_dir does not return "." and ".." on Linux, so the vec should be empty
+    assert!(
+        entries.is_empty(),
+        "empty dir should have no entries from read_dir, got: {entries:?}"
+    );
+
+    mount.unmount();
+}
+
+#[tokio::test]
+async fn test_fuse_persistence_remount() {
+    let container = RustfsContainer::start().await;
+    let (storage1, storage2) = container.new_storage_pair().await;
+
+    // First mount: write files
+    let mut mount1 = FuseMount::new(storage1, "main").await;
+    let mp1 = mount1.path();
+
+    let mp = mp1.clone();
+    blocking(move || {
+        std::fs::create_dir(mp.join("projects")).unwrap();
+        std::fs::write(mp.join("projects").join("code.rs"), b"fn main() {}").unwrap();
+        std::fs::write(mp.join("notes.txt"), b"important notes").unwrap();
+        std::fs::write(mp.join("config.toml"), b"[settings]\nkey = \"value\"").unwrap();
+    })
+    .await;
+
+    // Unmount (triggers commit)
+    mount1.unmount();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Second mount with a different client pointing at same buckets
+    let mut mount2 = FuseMount::new(storage2, "main").await;
+    let mp2 = mount2.path();
+
+    // Verify all files are present and correct
+    let mp = mp2.clone();
+    let results = blocking(move || {
+        (
+            std::fs::read(mp.join("projects").join("code.rs")).unwrap(),
+            std::fs::read(mp.join("notes.txt")).unwrap(),
+            std::fs::read(mp.join("config.toml")).unwrap(),
+        )
+    })
+    .await;
+
+    assert_eq!(results.0, b"fn main() {}");
+    assert_eq!(results.1, b"important notes");
+    assert_eq!(results.2, b"[settings]\nkey = \"value\"");
+
+    // Verify directory listing works for nested dir
+    let mp = mp2.clone();
+    let mut names: Vec<String> = blocking(move || {
+        std::fs::read_dir(mp.join("projects"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+            .collect()
+    })
+    .await;
+    names.sort();
+    assert_eq!(names, vec!["code.rs"]);
+
+    // Verify root directory listing
+    let mp = mp2.clone();
+    let mut root_names: Vec<String> = blocking(move || {
+        std::fs::read_dir(&mp)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+            .collect()
+    })
+    .await;
+    root_names.sort();
+    assert_eq!(root_names, vec!["config.toml", "notes.txt", "projects"]);
+
+    mount2.unmount();
 }
