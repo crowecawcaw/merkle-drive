@@ -2139,11 +2139,17 @@ async fn test_fuse_flush_storage_error_returns_eio() {
     // Enable write failures
     injector.set_fail_writes(true);
 
-    // Try to fsync (triggers do_commit which will fail)
+    // Write again to re-dirty the filesystem (FUSE write is in-memory, won't
+    // hit storage), then fsync which triggers do_commit and will fail.
     let mp2 = mp.clone();
     let result = blocking(move || {
+        use std::io::Write;
         use std::os::unix::io::AsRawFd;
-        let f = std::fs::File::open(mp2.join("fail.txt")).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(mp2.join("fail.txt"))
+            .unwrap();
+        f.write_all(b"dirty again").unwrap();
 
         unsafe { libc::fsync(f.as_raw_fd()) }
     })
@@ -2168,13 +2174,18 @@ async fn test_fuse_read_after_failed_commit() {
     })
     .await;
 
-    // Enable failures then try to sync (will fail)
+    // Enable failures then write again to re-dirty, then sync (will fail)
     injector.set_fail_writes(true);
 
     let mp2 = mp.clone();
     blocking(move || {
+        use std::io::Write;
         use std::os::unix::io::AsRawFd;
-        let f = std::fs::File::open(mp2.join("recover.txt")).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(mp2.join("recover.txt"))
+            .unwrap();
+        f.write_all(b"still here").unwrap();
         let _ = unsafe { libc::fsync(f.as_raw_fd()) };
     })
     .await;
