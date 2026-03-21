@@ -1090,7 +1090,7 @@ async fn test_fuse_open_with_o_trunc() {
 
     let mp2 = mp.clone();
     blocking(move || {
-        std::fs::write(mp2.join("trunc_open.txt"), &[0xAA; 100]).unwrap();
+        std::fs::write(mp2.join("trunc_open.txt"), [0xAA; 100]).unwrap();
     })
     .await;
 
@@ -1126,10 +1126,7 @@ async fn test_fuse_read_nonexistent_file() {
     let mp2 = mp.clone();
     let err = blocking(move || std::fs::read(mp2.join("nope.txt"))).await;
     assert!(err.is_err());
-    assert_eq!(
-        err.unwrap_err().kind(),
-        std::io::ErrorKind::NotFound
-    );
+    assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::NotFound);
 
     mount.unmount();
 }
@@ -1361,8 +1358,8 @@ async fn test_fuse_overwrite_shrink() {
 
     let mp2 = mp.clone();
     blocking(move || {
-        std::fs::write(mp2.join("shrink.txt"), &[0xAA; 500]).unwrap();
-        std::fs::write(mp2.join("shrink.txt"), &[0xBB; 50]).unwrap();
+        std::fs::write(mp2.join("shrink.txt"), [0xAA; 500]).unwrap();
+        std::fs::write(mp2.join("shrink.txt"), [0xBB; 50]).unwrap();
     })
     .await;
 
@@ -1389,8 +1386,8 @@ async fn test_fuse_overwrite_grow() {
 
     let mp2 = mp.clone();
     blocking(move || {
-        std::fs::write(mp2.join("grow.txt"), &[0xAA; 50]).unwrap();
-        std::fs::write(mp2.join("grow.txt"), &[0xBB; 500]).unwrap();
+        std::fs::write(mp2.join("grow.txt"), [0xAA; 50]).unwrap();
+        std::fs::write(mp2.join("grow.txt"), [0xBB; 500]).unwrap();
     })
     .await;
 
@@ -1817,7 +1814,7 @@ async fn test_fuse_metadata_size_after_write() {
 
     let mp2 = mp.clone();
     blocking(move || {
-        std::fs::write(mp2.join("sized.txt"), &[0xAA; 100]).unwrap();
+        std::fs::write(mp2.join("sized.txt"), [0xAA; 100]).unwrap();
     })
     .await;
 
@@ -1989,8 +1986,7 @@ async fn test_fuse_recreate_deleted_directory() {
 
     // Verify old.txt does not exist
     let mp2 = mp.clone();
-    let old_exists =
-        blocking(move || mp2.join("dir").join("old.txt").exists()).await;
+    let old_exists = blocking(move || mp2.join("dir").join("old.txt").exists()).await;
     assert!(!old_exists);
 
     mount.unmount();
@@ -2148,8 +2144,8 @@ async fn test_fuse_flush_storage_error_returns_eio() {
     let result = blocking(move || {
         use std::os::unix::io::AsRawFd;
         let f = std::fs::File::open(mp2.join("fail.txt")).unwrap();
-        let ret = unsafe { libc::fsync(f.as_raw_fd()) };
-        ret
+
+        unsafe { libc::fsync(f.as_raw_fd()) }
     })
     .await;
 
@@ -2373,7 +2369,7 @@ async fn test_fuse_read_past_eof() {
 
     let mp2 = mp.clone();
     blocking(move || {
-        std::fs::write(mp2.join("short.txt"), &[0xAA; 10]).unwrap();
+        std::fs::write(mp2.join("short.txt"), [0xAA; 10]).unwrap();
     })
     .await;
 
@@ -2400,7 +2396,7 @@ async fn test_fuse_read_partial() {
 
     let mp2 = mp.clone();
     blocking(move || {
-        std::fs::write(mp2.join("partial.txt"), &[0xAA; 10]).unwrap();
+        std::fs::write(mp2.join("partial.txt"), [0xAA; 10]).unwrap();
     })
     .await;
 
