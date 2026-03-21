@@ -1,10 +1,17 @@
 # Agents
 
-## Pre-PR Checklist
+## Pre-commit Checklist
 
-Before opening a pull request, ensure:
+Run these checks before every commit. They mirror the CI pipeline
+(`.github/workflows/ci.yml`).
 
-1. `cargo fmt` — code is formatted
-2. `cargo clippy --all-targets` — no warnings
-3. `cargo test` — all unit tests pass
-4. `cargo test --test rustfs_integ_test` — all integration tests pass (requires Docker)
+1. **Format** — `cargo fmt --all -- --check`
+2. **Lint** — `cargo clippy --all-targets`
+3. **Test** — `cargo test --all-targets`
+
+All three must pass with zero warnings (`RUSTFLAGS=-Dwarnings` is set in CI).
+
+### System dependency
+
+The project requires `libfuse3-dev` (`sudo apt-get install libfuse3-dev`) for
+compilation.
